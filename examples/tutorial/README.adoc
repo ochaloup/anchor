@@ -6,6 +6,16 @@ Python venv
 ----
 python3 -m venv ./venv
 source ./venv/bin/activate
----
+----
 
+Working with the tutorial step
 
+[source,sh]
+----
+cd examples/tutorial/basic-0
+# building creates the target/ directory with IDL files
+anchor build
+# check configuration of the test in Anchor.toml
+# anchor automatically starts the  Solana testing validator (and switches it off after test finishes)
+anchor test
+----
