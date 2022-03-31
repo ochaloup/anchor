@@ -31,8 +31,12 @@ async def test_secured_account(
 ) -> None:
     data_account_keypair = Keypair()
     # THIS DOES NOT WORK and I do not know how to access the AnchorPy in version 0.23.0 basic-4
-    # the program IDL contains 'state' and I don't know how to get it with API
-    await secured_account_program.rpc["new"](
+    # the program IDL contains 'state' and I don't know how to make it callable
+    print(f'>>>> {secured_account_program.idl.state.methods}')
+    new_method_list = list(filter(lambda p : p.name == 'new', secured_account_program.idl.state.methods))
+    new_method = new_method_list[0] if len(new_method_list) == 1 else None
+    print(f'>>>> {new_method} // _IdlInstruction')
+    await new_method(
         ctx=Context(
             accounts={
                 "authority": secured_account_program.provider.wallet.public_key
