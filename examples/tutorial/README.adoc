@@ -1,0 +1,11 @@
+= Notes on passing through tutorial stuff
+
+Python venv
+
+[source,sh]
+----
+python3 -m venv ./venv
+source ./venv/bin/activate
+---
+
+
