@@ -18,7 +18,7 @@ async def main():
     program_id = PublicKey("7RJ7c3E3rxFD3NScPVssfKk5psBVXEWjQBwPdex2DACE")
 
     # Generate the program client from IDL.
-    # context manager closes the http client in background what is needed
+    # context manager closes the http client in background what is needed (or program.close())
     async with Program(idl, program_id) as program:
         # Execute the RPC.
         logging.info(f"Running program {program_id}")

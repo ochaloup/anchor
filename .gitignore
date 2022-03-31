@@ -21,3 +21,4 @@ docker-target
 .rollup.cache/
 
 venv/
+__pycache__/
