@@ -21,7 +21,7 @@ mod basic_1 {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 8)]
+    #[account(init, payer = user, space = 8 + 8, constraint = my_account.data == 1)]
     pub my_account: Account<'info, MyAccount>,
     #[account(mut)]
     pub user: Signer<'info>,
