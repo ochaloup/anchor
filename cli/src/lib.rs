@@ -1,3 +1,4 @@
+use crate::base64serialize::{TransactionAccount, TransactionInstruction};
 use crate::config::{
     AnchorPackage, BootstrapMode, BuildConfig, Config, ConfigOverride, Manifest, ProgramArch,
     ProgramDeployment, ProgramWorkspace, ScriptsConfig, TestValidator, WithPath, SHUTDOWN_WAIT,
@@ -44,6 +45,7 @@ use std::str::FromStr;
 use std::string::ToString;
 use tar::Archive;
 
+pub mod base64serialize;
 pub mod config;
 mod path;
 pub mod rust_template;
@@ -337,6 +339,9 @@ pub enum IdlCommand {
     },
     Close {
         program_id: Pubkey,
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
+        #[clap(short, long)]
+        authority: Option<Pubkey>,
     },
     /// Writes an IDL into a buffer account. This can be used with SetBuffer
     /// to perform an upgrade.
@@ -351,6 +356,11 @@ pub enum IdlCommand {
         /// Address of the buffer account to set as the idl on the program.
         #[clap(short, long)]
         buffer: Pubkey,
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
+        /// Useful for multisig execution when the local wallet keypair is not available.
+        /// (Note: To use a different IDL authority than the wallet keypair, use --provider.wallet).
+        #[clap(short, long)]
+        authority: Option<Pubkey>,
     },
     /// Upgrades the IDL to the new file. An alias for first writing and then
     /// then setting the idl buffer account.
@@ -1824,14 +1834,19 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
             program_id,
             filepath,
         } => idl_init(cfg_override, program_id, filepath),
-        IdlCommand::Close { program_id } => idl_close(cfg_override, program_id),
+        IdlCommand::Close {
+            program_id,
+            authority,
+        } => idl_close(cfg_override, program_id, authority),
         IdlCommand::WriteBuffer {
             program_id,
             filepath,
         } => idl_write_buffer(cfg_override, program_id, filepath).map(|_| ()),
-        IdlCommand::SetBuffer { program_id, buffer } => {
-            idl_set_buffer(cfg_override, program_id, buffer)
-        }
+        IdlCommand::SetBuffer {
+            program_id,
+            buffer,
+            authority,
+        } => idl_set_buffer(cfg_override, program_id, buffer, authority),
         IdlCommand::Upgrade {
             program_id,
             filepath,
@@ -1867,12 +1882,18 @@ fn idl_init(cfg_override: &ConfigOverride, program_id: Pubkey, idl_filepath: Str
     })
 }
 
-fn idl_close(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
+fn idl_close(
+    cfg_override: &ConfigOverride,
+    program_id: Pubkey,
+    authority: Option<Pubkey>,
+) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         let idl_address = IdlAccount::address(&program_id);
-        idl_close_account(cfg, &program_id, idl_address)?;
+        idl_close_account(cfg, &program_id, idl_address, authority)?;
 
-        println!("Idl account closed: {idl_address:?}");
+        if authority.is_none() {
+            println!("Idl account closed: {idl_address:?}");
+        }
 
         Ok(())
     })
@@ -1898,19 +1919,29 @@ fn idl_write_buffer(
     })
 }
 
-fn idl_set_buffer(cfg_override: &ConfigOverride, program_id: Pubkey, buffer: Pubkey) -> Result<()> {
+fn idl_set_buffer(
+    cfg_override: &ConfigOverride,
+    program_id: Pubkey,
+    buffer: Pubkey,
+    authority: Option<Pubkey>,
+) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
             .map_err(|_| anyhow!("Unable to read keypair file"))?;
         let url = cluster_url(cfg, &cfg.test_validator);
         let client = RpcClient::new(url);
 
+        let idl_authority = if let Some(idl_authority) = authority {
+            idl_authority
+        } else {
+            keypair.pubkey()
+        };
         // Instruction to set the buffer onto the IdlAccount.
         let set_buffer_ix = {
             let accounts = vec![
                 AccountMeta::new(buffer, false),
                 AccountMeta::new(IdlAccount::address(&program_id), false),
-                AccountMeta::new(keypair.pubkey(), true),
+                AccountMeta::new(idl_authority, true),
             ];
             let mut data = anchor_lang::idl::IDL_IX_TAG.to_le_bytes().to_vec();
             data.append(&mut IdlInstruction::SetBuffer.try_to_vec()?);
@@ -1921,24 +1952,47 @@ fn idl_set_buffer(cfg_override: &ConfigOverride, program_id: Pubkey, buffer: Pub
             }
         };
 
-        // Build the transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[set_buffer_ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
+        // print only mdde
+        if authority.is_some() {
+            let transaction = TransactionInstruction {
+                program_id: set_buffer_ix.program_id,
+                accounts: set_buffer_ix
+                    .accounts
+                    .iter()
+                    .map(TransactionAccount::from)
+                    .collect(),
+                data: set_buffer_ix.data,
+            };
+            println!("Print only mode. No execution!");
+            println!(
+                "base64 set-buffer to idl account {} of program {}:",
+                IdlAccount::address(&set_buffer_ix.program_id),
+                set_buffer_ix.program_id
+            );
+            println!(
+                " {}",
+                anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+            );
+        } else {
+            // Build the transaction.
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &[set_buffer_ix],
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
 
-        // Send the transaction.
-        client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )?;
+            // Send the transaction.
+            client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )?;
+        }
 
         Ok(())
     })
@@ -1950,7 +2004,7 @@ fn idl_upgrade(
     idl_filepath: String,
 ) -> Result<()> {
     let buffer = idl_write_buffer(cfg_override, program_id, idl_filepath)?;
-    idl_set_buffer(cfg_override, program_id, buffer)
+    idl_set_buffer(cfg_override, program_id, buffer, None)
 }
 
 fn idl_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
@@ -2051,17 +2105,27 @@ fn idl_erase_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Res
     Ok(())
 }
 
-fn idl_close_account(cfg: &Config, program_id: &Pubkey, idl_address: Pubkey) -> Result<()> {
+fn idl_close_account(
+    cfg: &Config,
+    program_id: &Pubkey,
+    idl_address: Pubkey,
+    authority: Option<Pubkey>,
+) -> Result<()> {
     let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
     let url = cluster_url(cfg, &cfg.test_validator);
     let client = RpcClient::new(url);
 
+    let idl_authority = if let Some(idl_authority) = authority {
+        idl_authority
+    } else {
+        keypair.pubkey()
+    };
     // Instruction accounts.
     let accounts = vec![
         AccountMeta::new(idl_address, false),
-        AccountMeta::new_readonly(keypair.pubkey(), true),
-        AccountMeta::new(keypair.pubkey(), true),
+        AccountMeta::new_readonly(idl_authority, true),
+        AccountMeta::new(keypair.pubkey(), false),
     ];
     // Instruction.
     let ix = Instruction {
@@ -2069,22 +2133,40 @@ fn idl_close_account(cfg: &Config, program_id: &Pubkey, idl_address: Pubkey) -> 
         accounts,
         data: { serialize_idl_ix(anchor_lang::idl::IdlInstruction::Close {})? },
     };
-    // Send transaction.
-    let latest_hash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&keypair.pubkey()),
-        &[&keypair],
-        latest_hash,
-    );
-    client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        CommitmentConfig::confirmed(),
-        RpcSendTransactionConfig {
-            skip_preflight: true,
-            ..RpcSendTransactionConfig::default()
-        },
-    )?;
+
+    if authority.is_some() {
+        let transaction = TransactionInstruction {
+            program_id: ix.program_id,
+            accounts: ix.accounts.iter().map(TransactionAccount::from).collect(),
+            data: ix.data,
+        };
+        println!("Print only mode. No execution!");
+        println!(
+            "base64 close idl account {} of program {}:",
+            idl_address, ix.program_id
+        );
+        println!(
+            " {}",
+            anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+        );
+    } else {
+        // Send transaction.
+        let latest_hash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&keypair.pubkey()),
+            &[&keypair],
+            latest_hash,
+        );
+        client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            CommitmentConfig::confirmed(),
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..RpcSendTransactionConfig::default()
+            },
+        )?;
+    }
 
     Ok(())
 }
