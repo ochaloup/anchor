@@ -346,6 +346,9 @@ pub enum IdlCommand {
         program_id: Pubkey,
         #[clap(short, long)]
         filepath: String,
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
+        #[clap(short, long)]
+        authority: Option<Pubkey>,
     },
     /// Sets a new IDL buffer for the program.
     SetBuffer {
@@ -353,8 +356,7 @@ pub enum IdlCommand {
         /// Address of the buffer account to set as the idl on the program.
         #[clap(short, long)]
         buffer: Pubkey,
-        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed. This can be useful in case the authority is a multisig and cannot be executed with a local wallet keypair.
-        /// (Note: To use a different IDL authority than the wallet keypair, use --provider.wallet).
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
         #[clap(short, long)]
         authority: Option<Pubkey>,
     },
@@ -364,6 +366,11 @@ pub enum IdlCommand {
         program_id: Pubkey,
         #[clap(short, long)]
         filepath: String,
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
+        /// Useful for multisig execution when the local wallet keypair is not available.
+        /// (Note: To use a different IDL authority than the wallet keypair, use --provider.wallet).
+        #[clap(short, long)]
+        authority: Option<Pubkey>,
     },
     /// Sets a new authority on the IDL account.
     SetAuthority {
@@ -1834,7 +1841,8 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
         IdlCommand::WriteBuffer {
             program_id,
             filepath,
-        } => idl_write_buffer(cfg_override, program_id, filepath).map(|_| ()),
+            authority,
+        } => idl_write_buffer(cfg_override, program_id, filepath, &authority).map(|_| ()),
         IdlCommand::SetBuffer {
             program_id,
             buffer,
@@ -1843,7 +1851,8 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
         IdlCommand::Upgrade {
             program_id,
             filepath,
-        } => idl_upgrade(cfg_override, program_id, filepath),
+            authority,
+        } => idl_upgrade(cfg_override, program_id, filepath, authority),
         IdlCommand::SetAuthority {
             program_id,
             address,
@@ -1890,6 +1899,7 @@ fn idl_write_buffer(
     cfg_override: &ConfigOverride,
     program_id: Pubkey,
     idl_filepath: String,
+    authority: &Option<Pubkey>
 ) -> Result<Pubkey> {
     with_workspace(cfg_override, |cfg| {
         let keypair = cfg.provider.wallet.to_string();
@@ -1897,8 +1907,8 @@ fn idl_write_buffer(
         let bytes = fs::read(idl_filepath)?;
         let idl: Idl = serde_json::from_reader(&*bytes)?;
 
-        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl)?;
-        idl_write(cfg, &program_id, &idl, idl_buffer)?;
+        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl, authority)?;
+        idl_write(cfg, &program_id, &idl, idl_buffer, *authority)?;
 
         println!("Idl buffer created: {idl_buffer:?}");
 
@@ -1939,45 +1949,42 @@ fn idl_set_buffer(
             }
         };
 
-        let clonned_set_buffer_ix = set_buffer_ix.clone();
-        let transaction = TransactionInstruction {
-            program_id,
-            accounts: clonned_set_buffer_ix
-                .accounts
-                .iter()
-                .map(TransactionAccount::from)
-                .collect(),
-            data: clonned_set_buffer_ix.data,
-        };
-
         // print only mdde
         if authority.is_some() {
+            let transaction = TransactionInstruction {
+                program_id,
+                accounts: set_buffer_ix
+                    .accounts
+                    .iter()
+                    .map(TransactionAccount::from)
+                    .collect(),
+                data: set_buffer_ix.data,
+            };
             println!("Print only mode. No execution!");
             println!(
                 "base64 set-buffer instruction: {}",
                 anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
             );
-            return Ok(());
+        } else {
+            // Build the transaction.
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &[set_buffer_ix],
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
+
+            // Send the transaction.
+            client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )?;
         }
-
-        // Build the transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[set_buffer_ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
-
-        // Send the transaction.
-        client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )?;
 
         Ok(())
     })
@@ -1987,8 +1994,9 @@ fn idl_upgrade(
     cfg_override: &ConfigOverride,
     program_id: Pubkey,
     idl_filepath: String,
+    authority: Option<Pubkey>,
 ) -> Result<()> {
-    let buffer = idl_write_buffer(cfg_override, program_id, idl_filepath)?;
+    let buffer = idl_write_buffer(cfg_override, program_id, idl_filepath, &authority)?;
     idl_set_buffer(cfg_override, program_id, buffer, None)
 }
 
@@ -2132,7 +2140,7 @@ fn idl_close_account(cfg: &Config, program_id: &Pubkey, idl_address: Pubkey) -> 
 // Write the idl to the account buffer, chopping up the IDL into pieces
 // and sending multiple transactions in the event the IDL doesn't fit into
 // a single transaction.
-fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) -> Result<()> {
+fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey, authority: Option<Pubkey>) -> Result<()> {
     // Remove the metadata before deploy.
     let mut idl = idl.clone();
     idl.metadata = None;
@@ -2151,6 +2159,12 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         e.finish()?
     };
 
+    let idl_authority = if let Some(idl_authority) = authority {
+        idl_authority.clone()
+    } else {
+        keypair.pubkey()
+    };
+
     const MAX_WRITE_SIZE: usize = 1000;
     let mut offset = 0;
     while offset < idl_data.len() {
@@ -2165,7 +2179,7 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         // Instruction accounts.
         let accounts = vec![
             AccountMeta::new(idl_address, false),
-            AccountMeta::new_readonly(keypair.pubkey(), true),
+            AccountMeta::new_readonly(idl_authority, true),
         ];
         // Instruction.
         let ix = Instruction {
@@ -2173,22 +2187,39 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
             accounts,
             data,
         };
-        // Send transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
-        client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )?;
+
+        if authority.is_some() {
+            let transaction = TransactionInstruction {
+                program_id: *program_id,
+                accounts: ix
+                    .accounts
+                    .iter()
+                    .map(TransactionAccount::from)
+                    .collect(),
+                data: ix.data,
+            };
+            println!(
+                "base64 idl write instruction: {}",
+                anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+            );
+        } else {
+            // Send transaction.
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
+            client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )?;
+        }
         offset += MAX_WRITE_SIZE;
     }
     Ok(())
@@ -3219,7 +3250,7 @@ fn create_idl_account(
     }
 
     // Write directly to the IDL account buffer.
-    idl_write(cfg, program_id, idl, IdlAccount::address(program_id))?;
+    idl_write(cfg, program_id, idl, IdlAccount::address(program_id), None)?;
 
     Ok(idl_address)
 }
@@ -3229,6 +3260,7 @@ fn create_idl_buffer(
     keypair_path: &str,
     program_id: &Pubkey,
     idl: &Idl,
+    authority: &Option<Pubkey>
 ) -> Result<Pubkey> {
     let keypair = solana_sdk::signature::read_keypair_file(keypair_path)
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
@@ -3251,10 +3283,15 @@ fn create_idl_buffer(
     };
 
     // Program instruction to create the buffer.
+    let idl_authority = if let Some(idl_authority) = authority {
+        idl_authority.clone()
+    } else {
+        keypair.pubkey()
+    };
     let create_buffer_ix = {
         let accounts = vec![
             AccountMeta::new(buffer.pubkey(), false),
-            AccountMeta::new_readonly(keypair.pubkey(), true),
+            AccountMeta::new_readonly(idl_authority, true),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
         ];
         let mut data = anchor_lang::idl::IDL_IX_TAG.to_le_bytes().to_vec();
@@ -3266,24 +3303,53 @@ fn create_idl_buffer(
         }
     };
 
-    // Build the transaction.
-    let latest_hash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[create_account_ix, create_buffer_ix],
-        Some(&keypair.pubkey()),
-        &[&keypair, &buffer],
-        latest_hash,
-    );
+    if authority.is_some() {
+        let create_account_tix = TransactionInstruction {
+            program_id: *program_id,
+            accounts: create_account_ix
+                .accounts
+                .iter()
+                .map(TransactionAccount::from)
+                .collect(),
+            data: create_account_ix.data,
+        };
+        let create_buffer_tix = TransactionInstruction {
+            program_id: *program_id,
+            accounts: create_buffer_ix
+                .accounts
+                .iter()
+                .map(TransactionAccount::from)
+                .collect(),
+            data: create_buffer_ix.data,
+        };
+        println!(
+            "base64 create account instruction: {}",
+            anchor_lang::__private::base64::encode(&create_account_tix.try_to_vec()?)
+        );
+        println!(
+            "base64 create buffer instruction: {}",
+            anchor_lang::__private::base64::encode(&create_buffer_tix.try_to_vec()?)
+        );
+    } else {
+        // Build the transaction.
+        let latest_hash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &[create_account_ix, create_buffer_ix],
+            Some(&keypair.pubkey()),
+            &[&keypair, &buffer],
+            latest_hash,
+        );
 
-    // Send the transaction.
-    client.send_and_confirm_transaction_with_spinner_and_config(
-        &tx,
-        CommitmentConfig::confirmed(),
-        RpcSendTransactionConfig {
-            skip_preflight: true,
-            ..RpcSendTransactionConfig::default()
-        },
-    )?;
+        // Send the transaction.
+        client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            CommitmentConfig::confirmed(),
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..RpcSendTransactionConfig::default()
+            },
+        )?;
+    }
 
     Ok(buffer.pubkey())
 }
