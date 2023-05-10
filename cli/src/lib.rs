@@ -1,3 +1,4 @@
+use crate::base64serialize::{TransactionAccount, TransactionInstruction};
 use crate::config::{
     AnchorPackage, BootstrapMode, BuildConfig, Config, ConfigOverride, Manifest, ProgramArch,
     ProgramDeployment, ProgramWorkspace, ScriptsConfig, TestValidator, WithPath, SHUTDOWN_WAIT,
@@ -44,6 +45,7 @@ use std::str::FromStr;
 use std::string::ToString;
 use tar::Archive;
 
+pub mod base64serialize;
 pub mod config;
 mod path;
 pub mod rust_template;
@@ -351,6 +353,10 @@ pub enum IdlCommand {
         /// Address of the buffer account to set as the idl on the program.
         #[clap(short, long)]
         buffer: Pubkey,
+        /// This is the public key of the IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed. This can be useful in case the authority is a multisig and cannot be executed with a local wallet keypair.
+        /// (Note: To use a different IDL authority than the wallet keypair, use --provider.wallet).
+        #[clap(short, long)]
+        authority: Option<Pubkey>,
     },
     /// Upgrades the IDL to the new file. An alias for first writing and then
     /// then setting the idl buffer account.
@@ -1829,9 +1835,11 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
             program_id,
             filepath,
         } => idl_write_buffer(cfg_override, program_id, filepath).map(|_| ()),
-        IdlCommand::SetBuffer { program_id, buffer } => {
-            idl_set_buffer(cfg_override, program_id, buffer)
-        }
+        IdlCommand::SetBuffer {
+            program_id,
+            buffer,
+            authority,
+        } => idl_set_buffer(cfg_override, program_id, buffer, authority),
         IdlCommand::Upgrade {
             program_id,
             filepath,
@@ -1898,19 +1906,29 @@ fn idl_write_buffer(
     })
 }
 
-fn idl_set_buffer(cfg_override: &ConfigOverride, program_id: Pubkey, buffer: Pubkey) -> Result<()> {
+fn idl_set_buffer(
+    cfg_override: &ConfigOverride,
+    program_id: Pubkey,
+    buffer: Pubkey,
+    authority: Option<Pubkey>,
+) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
             .map_err(|_| anyhow!("Unable to read keypair file"))?;
         let url = cluster_url(cfg, &cfg.test_validator);
         let client = RpcClient::new(url);
 
+        let idl_authority = if let Some(idl_authority) = authority {
+            idl_authority
+        } else {
+            keypair.pubkey()
+        };
         // Instruction to set the buffer onto the IdlAccount.
         let set_buffer_ix = {
             let accounts = vec![
                 AccountMeta::new(buffer, false),
                 AccountMeta::new(IdlAccount::address(&program_id), false),
-                AccountMeta::new(keypair.pubkey(), true),
+                AccountMeta::new(idl_authority, true),
             ];
             let mut data = anchor_lang::idl::IDL_IX_TAG.to_le_bytes().to_vec();
             data.append(&mut IdlInstruction::SetBuffer.try_to_vec()?);
@@ -1920,6 +1938,27 @@ fn idl_set_buffer(cfg_override: &ConfigOverride, program_id: Pubkey, buffer: Pub
                 data,
             }
         };
+
+        let clonned_set_buffer_ix = set_buffer_ix.clone();
+        let transaction = TransactionInstruction {
+            program_id,
+            accounts: clonned_set_buffer_ix
+                .accounts
+                .iter()
+                .map(TransactionAccount::from)
+                .collect(),
+            data: clonned_set_buffer_ix.data,
+        };
+
+        // print only mdde
+        if authority.is_some() {
+            println!("Print only mode. No execution!");
+            println!(
+                "base64 set-buffer instruction: {}",
+                anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+            );
+            return Ok(());
+        }
 
         // Build the transaction.
         let latest_hash = client.get_latest_blockhash()?;
@@ -1950,7 +1989,7 @@ fn idl_upgrade(
     idl_filepath: String,
 ) -> Result<()> {
     let buffer = idl_write_buffer(cfg_override, program_id, idl_filepath)?;
-    idl_set_buffer(cfg_override, program_id, buffer)
+    idl_set_buffer(cfg_override, program_id, buffer, None)
 }
 
 fn idl_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
@@ -2012,6 +2051,7 @@ fn idl_set_authority(
             accounts,
             data,
         };
+
         // Send transaction.
         let latest_hash = client.get_latest_blockhash()?;
         let tx = Transaction::new_signed_with_payer(
