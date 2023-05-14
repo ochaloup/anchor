@@ -1952,9 +1952,8 @@ fn idl_set_buffer(
             }
         };
 
-        // print only mdde
         if authority.is_some() {
-            let transaction = TransactionInstruction {
+            let instruction = TransactionInstruction {
                 program_id: set_buffer_ix.program_id,
                 accounts: set_buffer_ix
                     .accounts
@@ -1971,7 +1970,7 @@ fn idl_set_buffer(
             );
             println!(
                 " {}",
-                anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+                anchor_lang::__private::base64::encode(&instruction.try_to_vec()?)
             );
         } else {
             // Build the transaction.
@@ -2135,7 +2134,7 @@ fn idl_close_account(
     };
 
     if authority.is_some() {
-        let transaction = TransactionInstruction {
+        let instruction = TransactionInstruction {
             program_id: ix.program_id,
             accounts: ix.accounts.iter().map(TransactionAccount::from).collect(),
             data: ix.data,
@@ -2147,7 +2146,7 @@ fn idl_close_account(
         );
         println!(
             " {}",
-            anchor_lang::__private::base64::encode(&transaction.try_to_vec()?)
+            anchor_lang::__private::base64::encode(&instruction.try_to_vec()?)
         );
     } else {
         // Send transaction.
