@@ -20,6 +20,26 @@ impl From<&TransactionInstruction> for Instruction {
     }
 }
 
+impl From<&Instruction> for TransactionInstruction {
+    fn from(ix: &Instruction) -> TransactionInstruction {
+        TransactionInstruction {
+            program_id: ix.program_id,
+            accounts: ix.accounts.iter().map(TransactionAccount::from).collect(),
+            data: ix.clone().data,
+        }
+    }
+}
+
+impl From<Instruction> for TransactionInstruction {
+    fn from(ix: Instruction) -> TransactionInstruction {
+        TransactionInstruction {
+            program_id: ix.program_id,
+            accounts: ix.accounts.iter().map(TransactionAccount::from).collect(),
+            data: ix.data,
+        }
+    }
+}
+
 #[derive(Debug, AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct TransactionAccount {
     pub pubkey: Pubkey,

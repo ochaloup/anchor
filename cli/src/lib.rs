@@ -1,4 +1,4 @@
-use crate::base64serialize::{TransactionAccount, TransactionInstruction};
+use crate::base64serialize::TransactionInstruction;
 use crate::config::{
     AnchorPackage, BootstrapMode, BuildConfig, Config, ConfigOverride, Manifest, ProgramArch,
     ProgramDeployment, ProgramWorkspace, ScriptsConfig, TestValidator, WithPath, SHUTDOWN_WAIT,
@@ -380,6 +380,10 @@ pub enum IdlCommand {
         /// New authority of the IDL account.
         #[clap(short, long)]
         new_authority: Pubkey,
+        /// A public key of the current (old) IDL authority. When used, the content of the instruction will only be printed in base64 form and not executed.
+        /// Useful for multisig execution when the local wallet keypair is not available.
+        #[clap(short, long)]
+        old_authority: Option<Pubkey>,
     },
     /// Command to remove the ability to modify the IDL account. This should
     /// likely be used in conjection with eliminating an "upgrade authority" on
@@ -1855,7 +1859,14 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
             program_id,
             address,
             new_authority,
-        } => idl_set_authority(cfg_override, program_id, address, new_authority),
+            old_authority,
+        } => idl_set_authority(
+            cfg_override,
+            program_id,
+            address,
+            new_authority,
+            old_authority,
+        ),
         IdlCommand::EraseAuthority { program_id } => idl_erase_authority(cfg_override, program_id),
         IdlCommand::Authority { program_id } => idl_authority(cfg_override, program_id),
         IdlCommand::Parse {
@@ -1953,20 +1964,12 @@ fn idl_set_buffer(
         };
 
         if authority.is_some() {
-            let instruction = TransactionInstruction {
-                program_id: set_buffer_ix.program_id,
-                accounts: set_buffer_ix
-                    .accounts
-                    .iter()
-                    .map(TransactionAccount::from)
-                    .collect(),
-                data: set_buffer_ix.data,
-            };
+            let instruction: TransactionInstruction = set_buffer_ix.into();
             println!("Print only mode. No execution!");
             println!(
                 "base64 set-buffer to idl account {} of program {}:",
-                IdlAccount::address(&set_buffer_ix.program_id),
-                set_buffer_ix.program_id
+                IdlAccount::address(&instruction.program_id),
+                instruction.program_id
             );
             println!(
                 " {}",
@@ -2037,6 +2040,7 @@ fn idl_set_authority(
     program_id: Pubkey,
     address: Option<Pubkey>,
     new_authority: Pubkey,
+    old_authority: Option<Pubkey>,
 ) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         // Misc.
@@ -2065,24 +2069,38 @@ fn idl_set_authority(
             accounts,
             data,
         };
-        // Send transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
-        client.send_and_confirm_transaction_with_spinner_and_config(
-            &tx,
-            CommitmentConfig::confirmed(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
-        )?;
 
-        println!("Authority update complete.");
+        if old_authority.is_some() {
+            let instruction: TransactionInstruction = ix.into();
+            println!("Print only mode. No execution!");
+            println!(
+                "base64 set-authority to idl account {} of program {}:",
+                idl_address, instruction.program_id
+            );
+            println!(
+                " {}",
+                anchor_lang::__private::base64::encode(&instruction.try_to_vec()?)
+            );
+        } else {
+            // Send transaction.
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
+            client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )?;
+
+            println!("Authority update complete.");
+        }
 
         Ok(())
     })
@@ -2099,7 +2117,7 @@ fn idl_erase_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Res
         return Ok(());
     }
 
-    idl_set_authority(cfg_override, program_id, None, ERASED_AUTHORITY)?;
+    idl_set_authority(cfg_override, program_id, None, ERASED_AUTHORITY, None)?;
 
     Ok(())
 }
@@ -2134,15 +2152,11 @@ fn idl_close_account(
     };
 
     if authority.is_some() {
-        let instruction = TransactionInstruction {
-            program_id: ix.program_id,
-            accounts: ix.accounts.iter().map(TransactionAccount::from).collect(),
-            data: ix.data,
-        };
+        let instruction: TransactionInstruction = ix.into();
         println!("Print only mode. No execution!");
         println!(
             "base64 close idl account {} of program {}:",
-            idl_address, ix.program_id
+            idl_address, instruction.program_id
         );
         println!(
             " {}",
