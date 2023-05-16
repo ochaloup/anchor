@@ -44,6 +44,7 @@ use std::process::{Child, Stdio};
 use std::str::FromStr;
 use std::string::ToString;
 use tar::Archive;
+use bincode::{serialize, DefaultOptions, Options};
 
 pub mod config;
 mod path;
@@ -1961,15 +1962,29 @@ fn idl_set_buffer(
         };
 
         if print_only {
+            let cloned = set_buffer_ix.clone();
+            let cloned2 = set_buffer_ix.clone();
             let instruction: TransactionInstruction = set_buffer_ix.into();
             println!("Print only mode. No execution!");
             println!(
                 "base64 set-buffer to idl account {} of program {}:",
                 idl_address, instruction.program_id
             );
+            let vec: Vec<u8> = serialize(&cloned).unwrap();
+            // let vec: Vec<u8> = cloned_borsh.try_to_vec()?;
+            let vec2: Vec<u8> = DefaultOptions::new().with_little_endian().allow_trailing_bytes().serialize(&cloned2).unwrap();
+
             println!(
                 " {}",
                 anchor_lang::__private::base64::encode(&instruction.try_to_vec()?)
+            );
+            println!(
+                "*{}",
+                anchor_lang::__private::base64::encode(vec)
+            );
+            println!(
+                "#{}",
+                anchor_lang::__private::base64::encode(vec2)
             );
         } else {
             // Build the transaction.

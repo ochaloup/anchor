@@ -169,6 +169,7 @@ dependencies = [
  "anchor-lang",
  "anchor-syn",
  "anyhow",
+ "bincode",
  "cargo_toml",
  "chrono",
  "clap 4.2.4",
