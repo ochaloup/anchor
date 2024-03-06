@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::str::FromStr;
 use std::string::ToString;
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use tar::Archive;
 
 mod checks;
@@ -2245,7 +2246,7 @@ fn idl_set_buffer(
             // Build the transaction.
             let latest_hash = client.get_latest_blockhash()?;
             let tx = Transaction::new_signed_with_payer(
-                &[ix],
+                &[priority_fee_ix(), ix],
                 Some(&keypair.pubkey()),
                 &[&keypair],
                 latest_hash,
@@ -2265,7 +2266,9 @@ fn idl_upgrade(
     idl_filepath: String,
 ) -> Result<()> {
     let buffer_address = idl_write_buffer(cfg_override, program_id, idl_filepath)?;
+    println!("Idl buffer created: {buffer_address}");
     let idl_address = idl_set_buffer(cfg_override, program_id, buffer_address, false)?;
+    println!("Idl buffer set: {buffer_address}");
     idl_close(cfg_override, program_id, Some(buffer_address), false)?;
     println!("Idl account {idl_address} successfully upgraded");
     Ok(())
@@ -2339,7 +2342,7 @@ fn idl_set_authority(
             // Send transaction.
             let latest_hash = client.get_latest_blockhash()?;
             let tx = Transaction::new_signed_with_payer(
-                &[ix],
+                &[priority_fee_ix(), ix],
                 Some(&keypair.pubkey()),
                 &[&keypair],
                 latest_hash,
@@ -2404,7 +2407,7 @@ fn idl_close_account(
         // Send transaction.
         let latest_hash = client.get_latest_blockhash()?;
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[priority_fee_ix(), ix],
             Some(&keypair.pubkey()),
             &[&keypair],
             latest_hash,
@@ -2437,7 +2440,7 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         e.finish()?
     };
 
-    const MAX_WRITE_SIZE: usize = 1000;
+    const MAX_WRITE_SIZE: usize = 900;
     let mut offset = 0;
     while offset < idl_data.len() {
         // Instruction data.
@@ -2462,7 +2465,7 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         // Send transaction.
         let latest_hash = client.get_latest_blockhash()?;
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &[priority_fee_ix(), ix],
             Some(&keypair.pubkey()),
             &[&keypair],
             latest_hash,
@@ -3770,6 +3773,11 @@ fn upgrade(
     })
 }
 
+fn priority_fee_ix() -> Instruction {
+    // println!("Adding compute unit price to the transaction...");
+    ComputeBudgetInstruction::set_compute_unit_price(50)
+}
+
 fn create_idl_account(
     cfg: &Config,
     keypair_path: &str,
@@ -3801,6 +3809,7 @@ fn create_idl_account(
 
         let num_additional_instructions = data_len / 10000;
         let mut instructions = Vec::new();
+        instructions.push(priority_fee_ix());
         let data = serialize_idl_ix(anchor_lang::idl::IdlInstruction::Create { data_len })?;
         let program_signer = Pubkey::find_program_address(&[], program_id).0;
         let accounts = vec![
@@ -3890,15 +3899,24 @@ fn create_idl_buffer(
     // Build the transaction.
     let latest_hash = client.get_latest_blockhash()?;
     let tx = Transaction::new_signed_with_payer(
-        &[create_account_ix, create_buffer_ix],
+        &[priority_fee_ix(), create_account_ix],
         Some(&keypair.pubkey()),
         &[&keypair, &buffer],
         latest_hash,
     );
-
+    // Send the transaction.
+    client.send_and_confirm_transaction_with_spinner(&tx)?;
+    let latest_hash = client.get_latest_blockhash()?;
+    let tx = Transaction::new_signed_with_payer(
+        &[priority_fee_ix(), create_buffer_ix],
+        Some(&keypair.pubkey()),
+        &[&keypair],
+        latest_hash,
+    );
     // Send the transaction.
     client.send_and_confirm_transaction_with_spinner(&tx)?;
 
+    println!("IDL buffer account created: {}", buffer.pubkey());
     Ok(buffer.pubkey())
 }
 
