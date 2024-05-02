@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::str::FromStr;
 use std::string::ToString;
+use std::thread::sleep;
+use std::time::Duration;
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use tar::Archive;
 
 pub mod config;
@@ -2085,8 +2088,10 @@ fn idl_write_buffer(
         let bytes = fs::read(idl_filepath)?;
         let idl: Idl = serde_json::from_reader(&*bytes)?;
 
-        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl)?;
-        idl_write(cfg, &program_id, &idl, idl_buffer)?;
+        let priority_fee = Some(500_u64); // hardcoded
+        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl, priority_fee)?;
+        println!("Idl buffer created: {idl_buffer:?}");
+        idl_write(cfg, &program_id, &idl, idl_buffer, priority_fee)?;
 
         println!("Idl buffer created: {idl_buffer:?}");
 
@@ -2304,7 +2309,7 @@ fn idl_close_account(
 // Write the idl to the account buffer, chopping up the IDL into pieces
 // and sending multiple transactions in the event the IDL doesn't fit into
 // a single transaction.
-fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) -> Result<()> {
+fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey, priority_fee: Option<u64>) -> Result<()> {
     // Remove the metadata before deploy.
     let mut idl = idl.clone();
     idl.metadata = None;
@@ -2323,9 +2328,10 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         e.finish()?
     };
 
-    const MAX_WRITE_SIZE: usize = 1000;
+    const MAX_WRITE_SIZE: usize = 600;
     let mut offset = 0;
     while offset < idl_data.len() {
+        println!("Step {offset}/{} ", idl_data.len());
         // Instruction data.
         let data = {
             let start = offset;
@@ -2346,14 +2352,31 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
             data,
         };
         // Send transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
-        client.send_and_confirm_transaction_with_spinner(&tx)?;
+        let instructions = prepend_compute_unit_ix(vec![ix], &client, priority_fee)?;
+
+        let retry_count = 50_u8;
+        for retry_transactions in 0..retry_count {
+            println!("Sending transaction retry: {retry_transactions}");
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
+
+            match client.send_and_confirm_transaction_with_spinner(&tx) {
+                Ok(_) => break,
+                Err(e) => {
+                    if retry_transactions == retry_count - 1 {
+                        sleep(Duration::from_secs(retry_count as u64));
+                        return Err(anyhow!("Error: {e}. Failed to send transaction."));
+                    }
+                    println!("Error: {:?}. Retrying transaction.", e);
+                }
+            }
+        }
+
         offset += MAX_WRITE_SIZE;
     }
     Ok(())
@@ -3695,7 +3718,7 @@ fn create_idl_account(
     }
 
     // Write directly to the IDL account buffer.
-    idl_write(cfg, program_id, idl, IdlAccount::address(program_id))?;
+    idl_write(cfg, program_id, idl, IdlAccount::address(program_id), None)?;
 
     Ok(idl_address)
 }
@@ -3705,6 +3728,7 @@ fn create_idl_buffer(
     keypair_path: &str,
     program_id: &Pubkey,
     idl: &Idl,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     let keypair = solana_sdk::signature::read_keypair_file(keypair_path)
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
@@ -3742,17 +3766,31 @@ fn create_idl_buffer(
         }
     };
 
-    // Build the transaction.
-    let latest_hash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[create_account_ix, create_buffer_ix],
-        Some(&keypair.pubkey()),
-        &[&keypair, &buffer],
-        latest_hash,
-    );
+    // hardcoded
+    let instructions = prepend_compute_unit_ix(
+        vec![create_account_ix, create_buffer_ix],
+        &client,
+        priority_fee,
+    )?;
 
-    // Send the transaction.
-    client.send_and_confirm_transaction_with_spinner(&tx)?;
+    for retries in 0..5 {
+        let latest_hash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&keypair.pubkey()),
+            &[&keypair, &buffer],
+            latest_hash,
+        );
+        match client.send_and_confirm_transaction_with_spinner(&tx) {
+            Ok(_) => break,
+            Err(err) => {
+                if retries == 4 {
+                    return Err(anyhow!("Error creating buffer account: {}", err));
+                }
+                println!("Error creating buffer account: {}. Retrying...", err);
+            }
+        }
+    }
 
     Ok(buffer.pubkey())
 }
@@ -4369,6 +4407,45 @@ fn get_node_version() -> Result<Version> {
         .unwrap()
         .trim();
     Version::parse(output).map_err(Into::into)
+}
+
+fn get_recommended_micro_lamport_fee(client: &RpcClient, priority_fee: Option<u64>) -> Result<u64> {
+    if let Some(priority_fee) = priority_fee {
+        return Ok(priority_fee);
+    }
+
+    let mut fees = client.get_recent_prioritization_fees(&[])?;
+
+    // Get the median fee from the most recent recent 150 slots' prioritization fee
+    fees.sort_unstable_by_key(|fee| fee.prioritization_fee);
+    let median_index = fees.len() / 2;
+
+    let median_priority_fee = if fees.len() % 2 == 0 {
+        (fees[median_index - 1].prioritization_fee + fees[median_index].prioritization_fee) / 2
+    } else {
+        fees[median_index].prioritization_fee
+    };
+
+    Ok(median_priority_fee)
+}
+
+fn prepend_compute_unit_ix(
+    instructions: Vec<Instruction>,
+    client: &RpcClient,
+    priority_fee: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    let priority_fee = get_recommended_micro_lamport_fee(client, priority_fee)?;
+
+    if priority_fee > 0 {
+        let mut instructions_appended = instructions.clone();
+        instructions_appended.insert(
+            0,
+            ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        );
+        Ok(instructions_appended)
+    } else {
+        Ok(instructions)
+    }
 }
 
 fn get_node_dns_option() -> Result<&'static str> {
