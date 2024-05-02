@@ -2333,9 +2333,9 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey, 
     while offset < idl_data.len() {
         println!("Step {offset}/{} ", idl_data.len());
         // Instruction data.
+        let end = std::cmp::min(offset + MAX_WRITE_SIZE, idl_data.len());
         let data = {
             let start = offset;
-            let end = std::cmp::min(offset + MAX_WRITE_SIZE, idl_data.len());
             serialize_idl_ix(anchor_lang::idl::IdlInstruction::Write {
                 data: idl_data[start..end].to_vec(),
             })?
@@ -2369,10 +2369,18 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey, 
                 Ok(_) => break,
                 Err(e) => {
                     if retry_transactions == retry_count - 1 {
-                        sleep(Duration::from_secs(retry_count as u64));
                         return Err(anyhow!("Error: {e}. Failed to send transaction."));
                     }
-                    println!("Error: {:?}. Retrying transaction.", e);
+                    println!("Error: {e}, but let's wait for 20s and see...");
+                    // hopefully it's already finalized
+                    sleep(Duration::from_secs(20));
+                    let idl_account = get_idl_account(&client, &idl_address)?;
+                    if (idl_account.data_len.saturating_sub(1) == end as u32) || (idl_account.data_len == end as u32) {
+                        println!("IDL already written for step {}, end bytes: {}", offset, end);
+                        break;
+                    } else {
+                        println!("Error: {:?}. Retrying transaction (step {}, end {}, data_len {}", e, offset, end, idl_account.data_len);
+                    }
                 }
             }
         }
