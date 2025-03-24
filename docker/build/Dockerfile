@@ -44,6 +44,6 @@ RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_CLI}/install)"
 RUN cargo install --git https://github.com/coral-xyz/anchor --tag ${ANCHOR_CLI} anchor-cli --locked
 
 # Build a dummy program to bootstrap the BPF SDK (doing this speeds up builds).
-RUN mkdir -p /tmp && cd tmp && anchor init dummy && cd dummy && anchor build
+RUN mkdir -p /tmp && cd tmp && anchor init dummy && cd dummy && cargo update bytemuck_derive@1.9.2 --precise 1.8.1 && anchor build
 
 WORKDIR /workdir
